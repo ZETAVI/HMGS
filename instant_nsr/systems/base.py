@@ -8,6 +8,9 @@ from instant_nsr.utils.misc import config_to_primitive, get_rank
 
 class BaseSystem(pl.LightningModule, SaverMixin):
     """
+    基础训练系统，继承自 PyTorch Lightning 的 LightningModule
+    Implements common functions for training, validation, testing, and prediction.
+
     Two ways to print to console:
     1. self.print: correctly handle progress bar
     2. rank_zero_info: use the logging module
@@ -17,6 +20,8 @@ class BaseSystem(pl.LightningModule, SaverMixin):
         self.config = config
         self.rank = get_rank()
         self.prepare()
+        # 工厂模式：根据配置文件中的 model.name (例如 "neus") 创建模型实例
+        # 工厂模式通过装饰器 + 字典注册表实现：
         self.model = models.make(self.config.model.name, self.config.model)
     
     def prepare(self):
@@ -71,14 +76,21 @@ class BaseSystem(pl.LightningModule, SaverMixin):
         return value
     
     def preprocess_data(self, batch, stage):
+        """
+        在子类中会重载
+        """
         pass
 
     """
     Implementing on_after_batch_transfer of DataModule does the same.
     But on_after_batch_transfer does not support DP.
     """
+    # 在每个训练 batch 之前：
     def on_train_batch_start(self, batch, batch_idx, unused=0):
+        # 1. Lightning 自动调用这个钩子
+        # 2. 加载当前数据集（train/val/test/predict）
         self.dataset = self.trainer.datamodule.train_dataloader().dataset
+        # 3. 预处理数据（neus子类中重载）
         self.preprocess_data(batch, 'train')
         update_module_step(self.model, self.current_epoch, self.global_step)
     
@@ -97,6 +109,9 @@ class BaseSystem(pl.LightningModule, SaverMixin):
         self.preprocess_data(batch, 'predict')
         update_module_step(self.model, self.current_epoch, self.global_step)
     
+    # Lightning 自动执行：
+    # - model.train()  # 切换到训练模式
+    # - batch = {k: v.cuda() for k, v in batch.items()}  # 数据迁移到 GPU
     def training_step(self, batch, batch_idx):
         raise NotImplementedError
     

@@ -46,11 +46,15 @@ class VarianceNetwork(nn.Module):
             else:
                 self.mod_val = min((global_step / self.reach_max_steps) * (self.max_inv_s - self.prev_inv_s) + self.prev_inv_s, self.max_inv_s)
 
-
+# 将类注册为 'neus', 以便通过工厂模式创建实例
 @register('neus')
 class NeuSModel(BaseModel):
     def setup(self):
+        # 1. 几何网络 (SDF Network)
+        # 使用的是volume-sdf-sg，输入坐标(x,y,z)，输出SDF值和特征向量
         self.geometry = models.make(self.config.geometry.name, self.config.geometry)
+        # 2. 纹理/辐射网络 (Radiance Network)
+        # 输入空间点、观察方向、法线、几何特征，输出RGB颜色
         self.texture = models.make(self.config.texture.name, self.config.texture)
         self.geometry.contraction_type = ContractionType.AABB
 
@@ -62,15 +66,24 @@ class NeuSModel(BaseModel):
             self.cone_angle_bg = 10**(math.log10(self.far_plane_bg) / self.config.num_samples_per_ray_bg) - 1.
             self.render_step_size_bg = 0.01            
 
+        # 3. 偏差网络 (Variance Network)
+        # NeuS的核心组件，学习SDF到密度转换的"S形曲线"的陡峭程度(方差)
         self.variance = VarianceNetwork(self.config.variance)
         self.register_buffer('scene_aabb', torch.as_tensor([-self.config.radius, -self.config.radius, -self.config.radius, self.config.radius, self.config.radius, self.config.radius], dtype=torch.float32))
+
+        # 4. NeuS中使用Occupancy Grid 占用网格来加速体渲染
         if self.config.grid_prune:
             if not self.config.gs_sampling:
+                # 传统NeuS：需要维护一个昂贵的占用网格来加速光线采样
                 self.occupancy_grid = OccupancyGrid(
                     roi_aabb=self.scene_aabb,
                     resolution=256,
                     contraction_type=ContractionType.AABB
                 )
+                # GSDF NeuS：注意这里！如果 config.gs_sampling 为 True
+                # 它直接跳过了占用网格的创建。
+                # 这意味着 NeuS 分支完全放弃了自我维护的加速结构，
+                # 而是依赖 GS 分支提供的深度图来进行 "Guided Sampling"。
             if self.config.learned_background:
                 self.occupancy_grid_bg = OccupancyGrid(
                     roi_aabb=self.scene_aabb,

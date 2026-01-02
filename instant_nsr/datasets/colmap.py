@@ -330,6 +330,10 @@ class ColmapIterableDataset(IterableDataset, ColmapDatasetBase):
     def __init__(self, config, split):
         self.setup(config, split)
 
+    # 这里有一个非常反直觉的设计：返回空字典！
+    # 它每一步都会产生一个空数据 batch={}
+    # 真正的采样: 发生在 NeuSSystem.on_train_batch_start -> preprocess_data 中
+    # System 直接访问 self.dataset.all_images (驻留在显存中的大 Tensor)
     def __iter__(self):
         while True:
             yield {}
@@ -364,6 +368,7 @@ class ColmapDataModule(pl.LightningDataModule):
             sampler=sampler
         )
     
+    # 数据加载器
     def train_dataloader(self):
         return self.general_loader(self.train_dataset, batch_size=1)
 

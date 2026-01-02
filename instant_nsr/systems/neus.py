@@ -142,32 +142,88 @@ def get_logger(path):
 @register('neus-system')
 class NeuSSystem(BaseSystem):
     """
-    Two ways to print to console:
-    1. self.print: correctly handle progress bar
-    2. rank_zero_info: use the logging module
-    """
-    def __init__(self, config):
-        super().__init__(config)
-        self.current_epoch_set=0
-        self.pretrain_step = 15000
-        self.geometry_awared_control = False
+    NeuS系统集成了Scaffold-GS和Instant-NSR用于神经表面重建。
+    该系统结合了两种方法：
+    1. Scaffold-GS：用于新视图合成的高斯溅射方法
+    2. Instant-NSR：使用有符号距离函数(SDF)的神经表面重建方法
+    
+    系统支持：
+    - 两个模型的联合训练与相互引导
+    - 使用Scaffold-GS预测进行深度引导的光线采样
+    - 高斯基元的几何感知密度控制
+    - 预训练模型加载或从头训练
+    - Tensorboard日志记录和可视化
+    
+    参数：
+        config: 包含模型、数据集和训练参数的配置对象
+    
+    属性：
+        current_epoch_set (int): 当前训练迭代计数器
+        pretrain_step (int): 预训练Scaffold-GS的迭代次数（默认：15000）
+        geometry_awared_control (bool): 是否使用几何感知密度控制
+        gaussians (GaussianModel): Scaffold-GS模型
+        scene (Scene): 用于相机和高斯基元的场景管理器
+        progress_bar (tqdm): 训练进度条
+        tb_writer (SummaryWriter): 用于日志记录的Tensorboard写入器
+    
+    训练流程：
+        1. 预训练：单独训练Scaffold-GS `pretrain_step`次迭代
+        2. 联合训练：使用以下方式训练两个模型：
+           - Scaffold-GS为Instant-NSR提供深度/法线引导
+           - Instant-NSR为Scaffold-GS的密度控制提供SDF
+           - 通过深度和法线一致性损失进行相互监督
+    
+    关键特性：
+        - 基于复杂度的动态光线采样
+        - 自适应损失权重（迭代15000后法线/深度损失降低）
+        - 使用预测的SDF进行几何感知的高斯致密化
+        - 带预热期的多阶段训练
 
+    Two ways to print to console:
+        1. self.print: correctly handle progress bar 正确处理进度条
+        2. rank_zero_info: use the logging module 使用logging模块
+    """
+    
+
+    
+    def __init__(self, config):
+        """
+        GS分支的初始化 和 NeuS隐式分支的初始化        
+        初始化NeuS系统，设置预训练参数并配置Scaffold-GS模型。
+
+        Sub-Component: GaussianModel and Scene (from gaussian_splatting)
+       
+        """
+        # 触发父类NEuS模型的初始化
+        super().__init__(config)
+
+        # 初始化预训练和几何感知控制参数
+        self.current_epoch_set = 0  # 当前训练迭代计数
+        self.pretrain_step = 15000  # 预训练步数
+        self.geometry_awared_control = False  # 几何感知控制标志（即3dgs是否会利用SDF的信息）
+
+        # 如果启用高斯分支
         if self.config.model.if_gaussian:
+            # 设置参数解析器
             parser = ArgumentParser(description="Training script parameters")
             parser.source_path = config.dataset.root_dir
             print(parser.source_path)
+            
+            # 创建模型、优化和管线参数对象
             lp = ModelParams(parser)
             op = OptimizationParams(parser)
             pp = PipelineParams(parser)
+            
+            # 添加训练相关参数
             parser.add_argument('--ip', type=str, default="127.0.0.1")
             parser.add_argument('--port', type=int, default=6009)
             parser.add_argument('--debug_from', type=int, default=-1)
             parser.add_argument('--detect_anomaly', action='store_true', default=False)
-            parser.add_argument("--test_iterations", nargs="+", type=int, default=[self.pretrain_step,self.pretrain_step+15000, self.pretrain_step+30000,self.pretrain_step+100000])
-            parser.add_argument("--save_iterations", nargs="+", type=int, default=[self.pretrain_step,self.pretrain_step+15000, self.pretrain_step+30000,self.pretrain_step+100000])
+            parser.add_argument("--test_iterations", nargs="+", type=int, default=[self.pretrain_step, self.pretrain_step+15000, self.pretrain_step+30000, self.pretrain_step+100000])
+            parser.add_argument("--save_iterations", nargs="+", type=int, default=[self.pretrain_step, self.pretrain_step+15000, self.pretrain_step+30000, self.pretrain_step+100000])
             parser.add_argument("--quiet", action="store_true")
             parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-            parser.add_argument("--start_checkpoint", type=str, default = None)
+            parser.add_argument("--start_checkpoint", type=str, default=None)
             parser.add_argument('--if_merging', action='store_true', help="if using merging operator") 
             parser.add_argument('--config', required=True, help='path to config file')
             parser.add_argument('--gpu', default='0', help='GPU(s) to be used')
@@ -179,45 +235,70 @@ class NeuSSystem(BaseSystem):
             parser.add_argument('--exp_dir', default='./exp')
             group = parser.add_mutually_exclusive_group(required=True)
             group.add_argument('--train', action='store_true')
-            out_path = "output/"+config.tag
-            fake_input = ["--source_path",config.dataset.root_dir,"--model_path",out_path]
+            
+            # 设置输出路径
+            out_path = "output/" + config.tag
+            fake_input = ["--source_path", config.dataset.root_dir, "--model_path", out_path]
             fake_input.extend(sys.argv[1:])
             args = parser.parse_args(fake_input)
+            
+            # 创建输出目录和日志器
             os.makedirs(args.model_path, exist_ok=True)
             print(f'model_path: {args.model_path}')
             self.loggger = get_logger(args.model_path)
             self.loggger.info(f'args: {args}')
+            
+            # 准备输出和Tensorboard日志器
             self.tb_writer = self.prepare_output_and_logger(lp.extract(args))
-            safe_state(args.quiet)                        
+            safe_state(args.quiet)
             # Start GUI server, configure and run training
             # network_gui.init(args.ip, args.port)
+            
+            # 设置异常检测
             torch.autograd.set_detect_anomaly(args.detect_anomaly)
             args.resolution = config.dataset.img_downscale
-            self.args=args
+            self.args = args
+            
+            # 设置背景颜色
             bg_color = [1, 1, 1] if lp.extract(args).white_background else [0, 0, 0]
             self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
             
-            self.op =op.extract(args)
-            self.piplin=pp.extract(args)
+            # 提取参数
+            self.op = op.extract(args)
+            self.piplin = pp.extract(args)
             self.lp = lp.extract(args)
             self.saving_iterations = args.save_iterations
             self.testing_iterations = args.test_iterations
-            self.gaussians = GaussianModel(self.lp.feat_dim, self.lp.n_offsets, self.lp.voxel_size, self.lp.update_depth, self.lp.update_init_factor, self.lp.update_hierachy_factor, self.lp.use_feat_bank, self.lp.use_tcnn)
+            
+            # 创建高斯模型
+            self.gaussians = GaussianModel(self.lp.feat_dim, self.lp.n_offsets, self.lp.voxel_size, 
+                                          self.lp.update_depth, self.lp.update_init_factor, 
+                                          self.lp.update_hierachy_factor, self.lp.use_feat_bank, 
+                                          self.lp.use_tcnn)
             self.ema_loss_for_log = 0.0
             self.dataset_size=0
             self.last_iteration_time=0
-            #Using a pretrained Scaffold-GS
+
+            # 直接使用预训练的结果 Using a pretrained Scaffold-GS
             if self.config.model.using_pretrain:
-                self.scene = Scene(self.lp, self.gaussians, load_iteration=15000, shuffle=False, if_pretrain=self.config.model.using_pretrain,pretrain_path=self.config.model.using_pretrain_path,given_scale=self.config.dataset.neuralangelo_scale,given_center=self.config.dataset.neuralangelo_center)
+                # 实例化场景，主要于三维场景几何有关，负责维护相机位置和高斯点
+                self.scene = Scene(self.lp, self.gaussians, load_iteration=15000, shuffle=False, 
+                                  if_pretrain=self.config.model.using_pretrain,
+                                  pretrain_path=self.config.model.using_pretrain_path,
+                                  given_scale=self.config.dataset.neuralangelo_scale,
+                                  given_center=self.config.dataset.neuralangelo_center)
                 self.gaussians.training_setup(self.op)
                 self.gaussians.update_learning_rate(15000)
                 self.progress_bar = tqdm(range(15000, self.op.iterations), desc="Training progress")
                 self.viewpoint_stack = self.scene.getTrainCameras().copy()
                 self.viewpoint_candidate = self.scene.getTrainCameras().copy()
-            #Pretrain Scaffold-GS from scratch.
+            # 从头先训练scaffold Pretrain Scaffold-GS from scratch.
             else:
                 self.progress_bar = tqdm(range(0, self.op.iterations), desc="Training progress")               
-                self.scene = Scene(self.lp, self.gaussians, shuffle=False,given_scale=self.config.dataset.neuralangelo_scale,given_center=self.config.dataset.neuralangelo_center)
+                # 实例化场景，主要与三维场景几何有关，负责维护相机位置和高斯点
+                self.scene = Scene(self.lp, self.gaussians, 
+                                   shuffle=False,given_scale=self.config.dataset.neuralangelo_scale,
+                                   given_center=self.config.dataset.neuralangelo_center)
                 
                 self.gaussians.training_setup(self.op)
                 self.viewpoint_stack = self.scene.getTrainCameras().copy()
@@ -233,19 +314,28 @@ class NeuSSystem(BaseSystem):
         self.train_num_rays = self.config.model.train_num_rays
 
     def forward(self, batch, gs_depth=None, use_depth_guide=False):
+        """
+        调用instant-nsr模型的前向传递函数, 进行SDF的预测和渲染.
+        """
         return self.model(batch['rays'], gs_depth, use_depth_guide)
     
     def preprocess_data(self, batch, stage):
+        """
+        预处理batch中的数据, 选取图片/像素点, 构建光线并准备RGB值/前景掩码.
+        """
         
         if 'index' in batch: # validation / testing
             index = batch['index']
         else:
+            # 如果batch中没有指定训练的图像索引，则随机选择一个图像索引
             if self.config.model.batch_image_sampling:
                 index = torch.randint(0, len(self.dataset.all_images), size=(self.train_num_rays,), device=self.dataset.all_images.device)
                 
             else:
                 index = torch.randint(0, len(self.dataset.all_images), size=(1,), device=self.dataset.all_images.device)
+
         if stage in ['train']:
+            # 随机选点，在图片上随机采样train_num_rays个像素点
             c2w = self.dataset.all_c2w[index]
             x = torch.randint(
                 0, self.dataset.w, size=(self.train_num_rays,), device=self.dataset.all_images.device
@@ -257,9 +347,13 @@ class NeuSSystem(BaseSystem):
                 directions = self.dataset.directions[y, x]
             elif self.dataset.directions.ndim == 4: # (N, H, W, 3)
                 directions = self.dataset.directions[index, y, x]
+            # 构建光线：根据相机位姿和方向计算光线的起点和方向
             rays_o, rays_d = get_rays(directions, c2w)
 
+            # Ground Truth 像素颜色：直接从显存中的全量数据 (self.dataset.all_images) 读取 RGB 值
             rgb = self.dataset.all_images[index, y, x].view(-1, self.dataset.all_images.shape[-1]).to(self.rank)
+            # 每个训练图的前景掩码（提前处理好存储在显存中）
+            # todo 这里是否可以优化，不直接放在显存中
             fg_mask = self.dataset.all_fg_masks[index, y, x].view(-1).to(self.rank)
 
         else:
@@ -287,6 +381,7 @@ class NeuSSystem(BaseSystem):
             self.model.background_color = torch.ones((3,), dtype=torch.float32, device=self.rank)
         
         if self.dataset.apply_mask:
+            # 前景掩码应用于RGB值
             rgb = rgb * fg_mask[...,None] + self.model.background_color * (1 - fg_mask[...,None])
         if stage in ['train']:
             batch.update({
@@ -380,6 +475,15 @@ class NeuSSystem(BaseSystem):
 
     # Training step for both Scaffold-GS and Instant-nsr
     def training_step(self, batch, batch_idx):
+        """
+        这里是 GSDF 项目的核心：双分支训练(Scaffold-GS和Instant-NSR)
+
+        明确每一训练步数下, 如何渲染/两个branch对齐/计算loss联合优化
+        
+        :param self: 说明
+        :param batch: 说明
+        :param batch_idx: 说明
+        """
         random_background = torch.rand(3).cuda()
         datasetname=self.args.source_path.split('/')[-1]
         time1=time.time()
@@ -394,13 +498,16 @@ class NeuSSystem(BaseSystem):
         loss_gaussian=0
 
         # Reducing the normal and depth loss weight in the later iterations
+        # 在训练的后期迭代中减少法线和深度损失的权重
         if self.current_epoch_set > 15000:
         # if self.current_epoch_set > (self.op.iterations-15000)/2:
             self.config.system.loss.normal_w = self.config.system.loss.normal_w/10
             self.config.system.loss.depth_w = self.config.system.loss.depth_w/10
 
+        # --- GS 分支（Gaussian Splatting）---
         # Training for Scaffold-GS
         if self.config.model.if_gaussian:
+            # 计算GS当前全部累加的迭代数
             current_epoch_gs = self.current_epoch_set + self.pretrain_step
             iter_start = torch.cuda.Event(enable_timing = True)
             iter_end = torch.cuda.Event(enable_timing = True)
@@ -408,6 +515,7 @@ class NeuSSystem(BaseSystem):
             self.gaussians.update_learning_rate(current_epoch_gs)
 
             # Get the same image index as Instant-nsr
+            # 1. 获取相机视角
             viewpoint_cam = self.scene.getTrainCameras()[batch['used_index']]
 
             # Get the same pixel indexes as Instant-nsr
@@ -415,27 +523,40 @@ class NeuSSystem(BaseSystem):
             xx = batch['used_x']
 
             ## Forward of Scaffold-GS
-            # filter 3D Gaussians out of frumstum.
+            # 2. filter 3D Gaussians out of frumstum.
             # voxel_visible_mask = gaussian_renderer.prefilter_voxel(viewpoint_cam, self.gaussians, self.piplin, self.background)
             voxel_visible_mask = gaussian_renderer.prefilter_voxel(viewpoint_cam, self.gaussians, self.piplin, random_background)
 
+            # Determine whether to retain gradients for updating Gaussians
             retain_grad = (current_epoch_gs < self.op.update_until and current_epoch_gs >= 0)
+
+            # 3. Gaussian 渲染（生成 RGB + Depth + Normal）
             render_pkg = gaussian_renderer.render(viewpoint_cam, self.gaussians, self.piplin, random_background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, out_depth=True, return_normal=True, radius=self.config.model.radius)
 
             # render_pkg = gaussian_renderer.render(viewpoint_cam, self.gaussians, self.piplin, self.background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, out_depth=True, return_normal=True, radius=self.config.model.radius)
             image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity_gs, gs_depth_hand,gs_normal = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"], render_pkg["depth_hand"], render_pkg["gs_normal"]
+
+            # 4. 提取深度图（用于指导 SDF）
             gs_depth = gs_depth_hand.mean(dim=0,keepdim=True).permute(1, 2, 0)
-            picked_gs_depth = gs_depth[yy,xx]
+            picked_gs_depth = gs_depth[yy,xx]   # 选择与 SDF 相同的像素
+            # 5. 提取法线图（用于指导 SDF）
             gs_normal = gs_normal.permute(1, 2, 0)
             picked_gs_normal = gs_normal[yy,xx]
+
             time2=time.time()
             time_1=time2-time1
             
             self.tb_writer.add_scalar(f'{datasetname}'+'/time_1', time_1, self.current_epoch_set)
+
+        # --- SDF 分支（Neural SDF）---
         # Using predicted depth of Scaffold-GS to guide the ray sampling of Instant-nsr after warm-up of Instant-nsr.
+        # 4. Detach GS 深度（因为这个gsdepth后传入到sdf网络中进行位置的采样，为了避免后续sdf的梯度更新泄漏到gs中，需要detach）
         picked_gs_depth_dt = picked_gs_depth.detach()
+
+        # 在Instant-nsr的预热期内（5K步）不使用深度引导采样
         # if self.current_epoch_set > self.config.model.geometry.xyz_encoding_config.start_step and self.current_epoch_set%500>100:
         if self.current_epoch_set > self.config.model.geometry.xyz_encoding_config.start_step:
+            # 调用Instant-nsr的前向传播，即NeusSystem的forward函数
             out = self(batch, picked_gs_depth_dt, use_depth_guide=True) 
         else:
             out = self(batch, picked_gs_depth_dt, use_depth_guide=False)
@@ -451,12 +572,16 @@ class NeuSSystem(BaseSystem):
         loss = 0.
 
         # predicted normal and depth of Scaffold-GS, taken as GT of the Instant-NSR side
+        # out['rays_valid'][...,0]可能是一个mask，表示哪些光线是有效的，然后在gs的预测中选择对应的深度和法线
         fixed_picked_gs_normal = picked_gs_normal[out['rays_valid'][...,0]].detach()
         fixed_picked_gs_depth = picked_gs_depth[out['rays_valid'][...,0]].detach()
+
         # The depth loss for the Instant-nsr.
         diff_neus = torch.abs(out['depth'][out['rays_valid'][...,0]] - fixed_picked_gs_depth)
 
         # Filter out the huge depth differents, which could be the impact of background.
+        # 选择性地过滤掉巨大的深度差异，这些差异可能是背景的影响。
+        # 具体来说，根据当前场景的半径来设定一个阈值(depth_ratio)，超过这个阈值的深度差异将被视为异常值并被忽略。
         if self.current_epoch_set > self.config.model.geometry.xyz_encoding_config.start_step:
             depth_ratio = 10.0
         else:
@@ -465,10 +590,12 @@ class NeuSSystem(BaseSystem):
         diff_neus_count = (diff_neus>0).sum()
         loss_depth_L1 = diff_neus.sum() / (diff_neus_count+1e-8)
         # normalzied the depth loss by the frontground size.
+        # 这里的loss_depth_L1 只会影响到Instant-nsr的训练
         loss += loss_depth_L1 * self.C(self.config.system.loss.depth_w)/self.config.model.radius
         self.log('train/loss_depth_L1_neus', float(loss_depth_L1/self.config.model.radius))
 
         # The normal loss for the Instant-nsr is only taken into account after the warmup period.
+        # Instant-nsr的法线损失仅在预热期后才被考虑。 同样，法线损失也只会影响Instant-nsr的训练
         if self.current_epoch_set > self.config.model.geometry.xyz_encoding_config.start_step:
             normal_diff = self.cos_similarity_loss(fixed_picked_gs_normal,out['comp_normal'][out['rays_valid'][...,0]])
             loss +=  normal_diff * self.config.system.loss.normal_w
@@ -484,28 +611,32 @@ class NeuSSystem(BaseSystem):
         self.log('train/num_rays', float(self.train_num_rays), prog_bar=True)
 
         # RGB L1 loss
+        # nens branch 的 RGB L1 损失，与GT RGB 进行对齐
         loss_rgb_l1 = F.l1_loss(out['comp_rgb_full'][out['rays_valid_full'][...,0]], batch['rgb'][out['rays_valid_full'][...,0]])
         self.log('train/loss_rgb', loss_rgb_l1)
         loss += loss_rgb_l1 * self.C(self.config.system.loss.lambda_rgb_l1)        
 
-        # Eikonal loss
+        # Eikonal loss for SDF regularization
         loss_eikonal = ((torch.linalg.norm(out['sdf_grad_samples'], ord=2, dim=-1) - 1.)**2).mean()
         self.log('train/loss_eikonal', loss_eikonal)
         loss += loss_eikonal * self.C(self.config.system.loss.lambda_eikonal)
 
         # Curvature loss, Note that the curvature loss weight is adaptived to the training iteration.
+        # 曲率损失，让SDF更平滑
         if self.C(self.config.system.loss.lambda_smoothing)>0:
             loss_smoothing = out['smoothing'].abs().mean()
             self.log('train/loss_smoothing', loss_smoothing)
             
             loss+=  loss_smoothing * self.C(self.config.system.loss.lambda_smoothing)
           
+        # todo 这里的是什么约束
         losses_model_reg = self.model.regularizations(out)
         for name, value in losses_model_reg.items():
             self.log(f'train/loss_{name}', value)
             loss_ = value * self.C(self.config.system.loss[f"lambda_{name}"])
             loss += loss_
         
+        # 输出lambda系数
         for name, value in self.config.system.loss.items():
             if name.startswith('lambda'):
                 self.log(f'train_params/{name}', self.C(value))
@@ -530,6 +661,7 @@ class NeuSSystem(BaseSystem):
                 scaling_reg = scaling.prod(dim=1).mean()
                 self.log('train/GS_scaling_reg', scaling_reg)
                 
+                # Neus指导的深度和法线一致性损失
                 # Predicted depth and normal of Instant-NSR, taken as GT of the GS side.
                 fixed_neus_picked_depth = out['depth'][out['rays_valid'][...,0]].detach()
                 fixed_neus_picked_normal = out['comp_normal'][out['rays_valid'][...,0]].detach()
@@ -550,6 +682,7 @@ class NeuSSystem(BaseSystem):
                 diff = torch.abs(fixed_neus_picked_depth - picked_gs_depth[out['rays_valid'][...,0]])
                 
                 # Filter out the huge depth differents, which could be the impact of background.
+                # 同样有背景过滤
                 depth_ratio = 10.0
                 
                 diff[diff > self.config.model.radius/depth_ratio] = 0
@@ -620,6 +753,7 @@ class NeuSSystem(BaseSystem):
                                     inside_box = (gs_positions > min_point) & (gs_positions < max_point)
                                     inside_box = inside_box.all(dim=1)
 
+                                    # 在区域内的3D高斯点位置，后续传入SDF网络计算inside_xyz_sdf
                                     inside_positions = gs_positions[inside_box]
                                     # set the sdf of 3D gaussians in the background to 100000.
                                     xyz_sdf = torch.ones(gs_positions.shape[0]).to(gs_positions.device)*100000
@@ -627,6 +761,7 @@ class NeuSSystem(BaseSystem):
                                     inside_xyz_sdf = self.model.geometry(inside_positions, with_grad=False, with_feature=False)
 
                                     xyz_sdf[inside_box] = inside_xyz_sdf
+
                                     # calculate the sdf of anchor points in the frontground
                                     anchor_positions = self.gaussians.get_anchor
                                     anchor_inside_box = (anchor_positions > min_point) & (anchor_positions < max_point)
@@ -639,6 +774,8 @@ class NeuSSystem(BaseSystem):
                                     anchor_sdf=None
                                     inside_box=None
                                     anchor_inside_box=None
+                                
+                                # 根据上面的sdf信息调整高斯点密度
                                 self.gaussians.adjust_anchor(check_interval=self.op.update_interval, extent=self.scene.cameras_extent, success_threshold=self.op.success_threshold, grad_threshold=self.op.densify_grad_threshold, min_opacity=self.op.min_opacity, xyz_sdf=xyz_sdf, anchor_sdf=anchor_sdf, inside_box=inside_box, anchor_inside_box=anchor_inside_box, growing_weight=self.config.system.growing_weight)
 
                     elif current_epoch_gs == self.op.update_until:

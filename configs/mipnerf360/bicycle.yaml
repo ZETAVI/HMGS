@@ -61,6 +61,7 @@ model:
       # per_level_scale: 1.381912879967
       include_xyz: true
       start_level: 8
+      # SDF分支什么时候开始使用gs的depth几何采样指导
       start_step: 5000
       update_steps: 2000
     mlp_network_config:
@@ -200,7 +201,9 @@ system:
           last_epoch: ${system.step2}
 
 checkpoint:
+  # 保留所有的检查点
   save_top_k: -1
+  # 每隔多少训练步保存一次检查点
   every_n_train_steps: ${trainer.max_steps}
 
 export:
@@ -208,12 +211,16 @@ export:
   export_vertex_color: False
 
 trainer:
-  
+  # 最大训练步数（优先级高于 max_epochs） 
   max_steps: 30000
   log_every_n_steps: 100
   num_sanity_val_steps: 0
+  # 每隔多少步进行一次验证 （1.0 = 每个 epoch 验证一次）
   val_check_interval: 15000
+  # 每个训练批次的最大样本比例（1.0表示使用全部样本）
   limit_train_batches: 1.0
+  # 限制每个验证批次的最大数量（1表示仅使用一个批次进行验证）
   limit_val_batches: 1
   enable_progress_bar: true
+  # 混合精度训练（16位浮点数，加速训练）
   precision: 32
