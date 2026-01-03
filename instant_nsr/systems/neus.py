@@ -357,15 +357,22 @@ class NeuSSystem(BaseSystem):
             fg_mask = self.dataset.all_fg_masks[index, y, x].view(-1).to(self.rank)
 
         else:
-            c2w = self.dataset.all_c2w[index][0]
+            # Ensure indices are on the same device as the indexed tensors
+            index_c2w = index.to(self.dataset.all_c2w.device)
+            c2w = self.dataset.all_c2w[index_c2w][0]
+
             if self.dataset.directions.ndim == 3: # (H, W, 3)
                 directions = self.dataset.directions
             elif self.dataset.directions.ndim == 4: # (N, H, W, 3)
-                directions = self.dataset.directions[index][0] 
+                index_dir = index.to(self.dataset.directions.device)
+                directions = self.dataset.directions[index_dir][0] 
             rays_o, rays_d = get_rays(directions, c2w)
             
-            rgb = self.dataset.all_images[index].view(-1, self.dataset.all_images.shape[-1]).to(self.rank)
-            fg_mask = self.dataset.all_fg_masks[index].view(-1).to(self.rank)
+            index_img = index.to(self.dataset.all_images.device)
+            rgb = self.dataset.all_images[index_img].view(-1, self.dataset.all_images.shape[-1]).to(self.rank)
+            
+            index_mask = index.to(self.dataset.all_fg_masks.device)
+            fg_mask = self.dataset.all_fg_masks[index_mask].view(-1).to(self.rank)
 
 
         rays = torch.cat([rays_o, F.normalize(rays_d, p=2, dim=-1)], dim=-1)
