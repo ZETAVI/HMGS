@@ -20,7 +20,9 @@ import sys
 from gaussian_splatting.scene import Scene, GaussianModel
 from gaussian_splatting.utils.general_utils import safe_state
 import uuid
-from gaussian_splatting.utils.image_utils import psnr
+from gaussian_splatting.utils.image_utils import psnr, error_map
+from gaussian_splatting.utils.visualize_utils import apply_depth_colormap
+from gaussian_splatting.utils.depth_utils import depth_to_normal
 from argparse import ArgumentParser, Namespace
 from gaussian_splatting.arguments import ModelParams, PipelineParams, OptimizationParams
 import os
@@ -82,20 +84,47 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     normal_gs = render_pkg["gs_normal"]
                     normal_gs_normal=(F.normalize(normal_gs, p=2, dim=0)+1)/2
 
+                    normal = render_pkg["normal"]
+                    normal = torch.nn.functional.normalize(normal, p=2, dim=0)
+                    # transform to world space
+                    c2w = (viewpoint.world_view_transform.T).inverse()
+                    normal2 = c2w[:3, :3] @ normal.reshape(3, -1)
+                    normal = normal2.reshape(3, *normal.shape[1:])
+                    normal = (normal + 1.) / 2.
+
+                    depth_black = render_pkg["depth_map"]
+                    depth_normal, _ = depth_to_normal(viewpoint, depth_black[None, ...])
+                    depth_normal = (depth_normal + 1.) / 2.
+                    depth_normal = depth_normal.permute(2, 0, 1)
+
+                    depth_map = apply_depth_colormap(depth_black[..., None], render_pkg["accumulation"][None, ...], near_plane=None, far_plane=None)
+                    depth_map = depth_map.permute(2, 0, 1)  # HWC -> CHW
+
+                    accumlated_alpha = render_pkg["accumulation"]
+                    colored_accum_alpha = apply_depth_colormap(accumlated_alpha, None, near_plane=0.0, far_plane=1.0)
+                    colored_accum_alpha = colored_accum_alpha.permute(2, 0, 1)
+
+                    error_image = error_map(image, gt_image)
+
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 38):
-                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/normal".format(viewpoint.image_name), normal_gs_normal[None], global_step=iteration)
-                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/depth".format(viewpoint.image_name), depth_gs[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/normal_GSDF".format(viewpoint.image_name), normal_gs_normal[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/depth_GSDF_black".format(viewpoint.image_name), depth_gs[None], global_step=iteration)
 
-                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/normal_gof".format(viewpoint.image_name), normal[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/depth_normal_gof".format(viewpoint.image_name), depth_normal[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/depth_map".format(viewpoint.image_name), depth_map[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/accumulated_alpha".format(viewpoint.image_name), colored_accum_alpha[None], global_step=iteration)
 
+                        tb_writer.add_images(config['name'] + "_view_{}/errormap_GSDF".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/errormap".format(viewpoint.image_name), error_image[None], global_step=iteration)
                         if wandb:
                             render_image_list.append(image[None])
                             errormap_list.append((gt_image[None]-image[None]).abs())
 
                         if iteration == testing_iterations[0]:
-                            tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                             if wandb:
                                 gt_image_list.append(gt_image[None])
 
@@ -107,13 +136,13 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                 logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 
                 if tb_writer:
-                    tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
                 if wandb is not None:
                     wandb.log({f"{config['name']}_loss_viewpoint_l1_loss":l1_test, f"{config['name']}_PSNR":psnr_test})
                 
         if tb_writer:
-            tb_writer.add_scalar(f'{dataset_name}/'+'total_points', scene.gaussians.get_anchor.shape[0], iteration)
+            tb_writer.add_scalar(config['name'] + '/total_points', scene.gaussians.get_anchor.shape[0], iteration)
             
         torch.cuda.empty_cache()
 
@@ -249,7 +278,7 @@ class NeuSSystem(BaseSystem):
             self.loggger.info(f'args: {args}')
             
             # 准备输出和Tensorboard日志器
-            self.tb_writer = self.prepare_output_and_logger(lp.extract(args))
+            self.tb_writer = self.prepare_output_and_logger(lp.extract(args), op.extract(args), pp.extract(args))
             safe_state(args.quiet)
             # Start GUI server, configure and run training
             # network_gui.init(args.ip, args.port)
@@ -920,7 +949,7 @@ class NeuSSystem(BaseSystem):
             **mesh
         )        
 
-    def prepare_output_and_logger(self,args):   
+    def prepare_output_and_logger(self, args, opt, pipe):   
 
         if not args.model_path:
             if os.getenv('OAR_JOB_ID'):
@@ -932,8 +961,17 @@ class NeuSSystem(BaseSystem):
         # Set up output folder
         print("Output folder: {}".format(args.model_path))
         os.makedirs(args.model_path, exist_ok = True)
-        with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+        with open(os.path.join(args.model_path, "GS_cfg_args"), 'w') as cfg_log_f:
             cfg_log_f.write(str(Namespace(**vars(args))))
+
+        with open(os.path.join(args.model_path, "GS_cfg_args_origin"), 'w') as cfg_log_f:
+            cfg_log_f.write(' '.join(sys.argv))
+
+        with open(os.path.join(args.model_path, "GS_cfg_args_opt"), 'w') as cfg_log_f:
+            cfg_log_f.write(str(Namespace(**vars(opt))))
+
+        with open(os.path.join(args.model_path, "GS_cfg_args_pipe"), 'w') as cfg_log_f:
+            cfg_log_f.write(str(Namespace(**vars(pipe))))
 
         # Create Tensorboard writer
         tb_writer = None
