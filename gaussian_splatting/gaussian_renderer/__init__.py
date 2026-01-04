@@ -152,8 +152,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         cov3D_precomp = None)
     rendered_image, radii = out[0], out[1]
     
+    # todo 假如depth，normal，accumulated输出
     if is_training:
-        return_dict =  {"render": rendered_image,
+        return_dict =  {"render": rendered_image[:3,:,:],
+                        "normal": rendered_image[3:6,:,:],
+                        "depth_map": rendered_image[6:7,:,:],
+                        "accumulation": rendered_image[7:8,:,:],
                         "viewspace_points": screenspace_points,
                         "visibility_filter" : radii > 0,
                         "radii": radii,
@@ -162,7 +166,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                         "neural_opacity": neural_opacity,
                         "scaling": scaling}
     else:
-        return_dict =  {"render": rendered_image,
+        return_dict =  {"render": rendered_image[:3,:,:],
+                        "normal": rendered_image[3:6,:,:],
+                        "depth_map": rendered_image[6:7,:,:],
+                        "accumulation": rendered_image[7:8,:,:],
                         "viewspace_points": screenspace_points,
                         "visibility_filter" : radii > 0,
                         "radii": radii,

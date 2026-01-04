@@ -1,4 +1,4 @@
-/*
+/*,,(//),
  * Copyright (C) 2023, Inria
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
@@ -265,6 +265,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		geomState.depths,
 		geomState.cov3D,
+		geomState.view2gaussian,
 		geomState.rgb,
 		geomState.conic_opacity,
 		tile_grid,
@@ -319,6 +320,7 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	const float* view2gaussian = geomState.view2gaussian;
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
@@ -326,6 +328,7 @@ int CudaRasterizer::Rasterizer::forward(
 		width, height,
 		geomState.means2D,
 		feature_ptr,
+		view2gaussian,
 		geomState.conic_opacity,
 		imgState.accum_alpha,
 		imgState.n_contrib,

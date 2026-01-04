@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 import torch as th
 import torch.nn.functional as F
+from matplotlib import cm
+
 
 
 def add_label_centered(
@@ -151,3 +153,54 @@ def visualize_normal(inputs, depth_p):
     normal_p = tensor2image(normal, label="normal_p")
 
     return normal_p
+
+
+def apply_colormap(image, cmap="viridis"):
+    colormap = cm.get_cmap(cmap)
+    colormap = th.tensor(colormap.colors).to(image.device)  # type: ignore
+    image_long = (image * 255).long()
+    image_long_min = th.min(image_long)
+    image_long_max = th.max(image_long)
+    assert image_long_min >= 0, f"the min value is {image_long_min}"
+    assert image_long_max <= 255, f"the max value is {image_long_max}"
+    return colormap[image_long[..., 0]]
+
+def apply_depth_colormap(
+    depth,
+    accumulation,
+    near_plane = 2.0,
+    far_plane = 6.0,
+    use_cmap = True,
+    cmap="turbo",
+):
+    '''将深度图映射为RGB图像
+    Args:
+        depth (torch.Tensor): 深度图，shape 为  (H, W, 1)
+        accumulation (float): 深度图的积累系数
+        near_plane (float): 深度图的最小深度值
+        far_plane (float): 深度图的最大深度值
+        cmap (str): matplotlib 的 colormap 名称
+    '''
+    # 将深度值从near_plane到far_plane范围映射到0到1之间。
+    # 短路逻辑或赋值（short-circuit OR assignment）模式 如果在使用该函数时传入了plane的设置,
+    near_plane = near_plane or float(th.min(depth))
+    far_plane = far_plane or float(th.max(depth))
+
+    depth = (depth - near_plane) / (far_plane - near_plane + 1e-10)
+    depth = th.clip(depth, 0, 1)
+    # depth = th.nan_to_num(depth, nan=0.0) # TODO(ethan): remove this
+
+    if use_cmap:
+        # 使用matplotlib的cmap（默认"turbo"）将标准化的深度值映射为RGB颜色。
+        colored_image = apply_colormap(depth, cmap=cmap)
+    else:
+        colored_image = depth
+
+    if accumulation is not None:
+        # 将颜色图像按像素乘以对应位置的累积不透明度,这部分强调了前景物体的颜色。
+        # 具体也不知道为什么要加上(1 - accumulation)
+        # 但整体效果是可以在深度图中突出显示前景物体的颜色，同时淡化背景区域。
+        # 有助于观察者更容易地辨别物体的形状和位置。
+        colored_image = colored_image * accumulation + (1 - accumulation)
+
+    return colored_image
