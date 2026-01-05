@@ -81,6 +81,7 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     depth_gs = render_pkg["depth_hand"]
                     depth_gs=depth_gs/depth_gs.max()
+                    depth_gs_map = apply_depth_colormap(render_pkg["depth_hand"][...,None], render_pkg["accumulation"][...,None], near_plane=None, far_plane=None)
                     normal_gs = render_pkg["gs_normal"]
                     normal_gs_normal=(F.normalize(normal_gs, p=2, dim=0)+1)/2
 
@@ -93,20 +94,21 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     normal = (normal + 1.) / 2.
 
                     depth_black = render_pkg["depth_map"]
-                    depth_normal, _ = depth_to_normal(viewpoint, depth_black[None, ...])
+                    depth_normal, _ = depth_to_normal(viewpoint, depth_black)
                     depth_normal = (depth_normal + 1.) / 2.
                     depth_normal = depth_normal.permute(2, 0, 1)
 
-                    depth_map = apply_depth_colormap(depth_black[..., None], render_pkg["accumulation"][None, ...], near_plane=None, far_plane=None)
+                    depth_map = apply_depth_colormap(depth_black.permute(1, 2, 0), render_pkg["accumulation"].permute(1, 2, 0), near_plane=None, far_plane=None)
                     depth_map = depth_map.permute(2, 0, 1)  # HWC -> CHW
 
                     accumlated_alpha = render_pkg["accumulation"]
-                    colored_accum_alpha = apply_depth_colormap(accumlated_alpha, None, near_plane=0.0, far_plane=1.0)
+                    colored_accum_alpha = apply_depth_colormap(accumlated_alpha.permute(1, 2, 0), None, near_plane=0.0, far_plane=1.0)
                     colored_accum_alpha = colored_accum_alpha.permute(2, 0, 1)
 
-                    error_image = error_map(image, gt_image)
 
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    error_image = error_map(image, gt_image)
+
                     if tb_writer and (idx < 38):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         tb_writer.add_images(config['name'] + "_view_{}/normal_GSDF".format(viewpoint.image_name), normal_gs_normal[None], global_step=iteration)
@@ -230,6 +232,9 @@ class NeuSSystem(BaseSystem):
         self.current_epoch_set = 0  # 当前训练迭代计数
         self.pretrain_step = 15000  # 预训练步数
         self.geometry_awared_control = False  # 几何感知控制标志（即3dgs是否会利用SDF的信息）
+        
+        # 防止loss权重多次减少
+        self.loss_weight_reduced = False
 
         # 如果启用高斯分支
         if self.config.model.if_gaussian:
@@ -248,7 +253,11 @@ class NeuSSystem(BaseSystem):
             parser.add_argument('--port', type=int, default=6009)
             parser.add_argument('--debug_from', type=int, default=-1)
             parser.add_argument('--detect_anomaly', action='store_true', default=False)
-            parser.add_argument("--test_iterations", nargs="+", type=int, default=[self.pretrain_step, self.pretrain_step+15000, self.pretrain_step+30000, self.pretrain_step+100000])
+            # default_steps = [100, 500, 1000, 2500, 5000, 7500, 10000, 12500, 15000] + [15000 + 2500 * i for i in range(0, 11)]
+            # [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000, 45000]
+            default_steps = [5000 * (i+1) for i in range(0, 9)]
+            parser.add_argument("--test_iterations", nargs="+", type=int, default=default_steps)
+            # parser.add_argument("--test_iterations", nargs="+", type=int, default=[self.pretrain_step, self.pretrain_step+15000, self.pretrain_step+30000, self.pretrain_step+100000])
             parser.add_argument("--save_iterations", nargs="+", type=int, default=[self.pretrain_step, self.pretrain_step+15000, self.pretrain_step+30000, self.pretrain_step+100000])
             parser.add_argument("--quiet", action="store_true")
             parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
@@ -535,10 +544,11 @@ class NeuSSystem(BaseSystem):
 
         # Reducing the normal and depth loss weight in the later iterations
         # 在训练的后期迭代中减少法线和深度损失的权重
-        if self.current_epoch_set > 15000:
+        if self.current_epoch_set > 15000 and not self.loss_weight_reduced:
         # if self.current_epoch_set > (self.op.iterations-15000)/2:
             self.config.system.loss.normal_w = self.config.system.loss.normal_w/10
             self.config.system.loss.depth_w = self.config.system.loss.depth_w/10
+            self.loss_weight_reduced = True
 
         # --- GS 分支（Gaussian Splatting）---
         # Training for Scaffold-GS
@@ -737,7 +747,7 @@ class NeuSSystem(BaseSystem):
                         depth_loss_gs  + \
                             normal_loss_gs
                 
-                self.log('train/loss_gaussian', float(loss_gaussian))
+                self.log('train/GS_loss_gaussian', float(loss_gaussian))
                 time41=time.time()
                 time_41=time41-time4
                 self.tb_writer.add_scalar(f'{datasetname}'+'/time_41', time_41, self.current_epoch_set)
@@ -759,7 +769,9 @@ class NeuSSystem(BaseSystem):
                     
                     if current_epoch_gs == self.op.iterations:
                         self.progress_bar.close()
+
                     training_report(self.tb_writer, self.args.source_path.split('/')[-1], current_epoch_gs, Ll1, loss_gaussian, l1_loss, iter_start.elapsed_time(iter_end), self.args.test_iterations, self.scene, gaussian_renderer.render, (self.piplin, self.background), None, self.loggger)
+
                     if (current_epoch_gs in self.saving_iterations):
                         self.loggger.info("\n[ITER {}] Saving Gaussians".format(current_epoch_gs))
                         self.scene.save(current_epoch_gs)
@@ -793,6 +805,16 @@ class NeuSSystem(BaseSystem):
                                     inside_positions = gs_positions[inside_box]
                                     # set the sdf of 3D gaussians in the background to 100000.
                                     xyz_sdf = torch.ones(gs_positions.shape[0]).to(gs_positions.device)*100000
+
+                                    # # 分批查询，减少峰值显存
+                                    # batch_size = 100000  # 每批10万点
+                                    # inside_xyz_sdf_list = []
+      
+                                    # for i in range(0, len(inside_positions), batch_size):
+                                    #     batch_pos = inside_positions[i:i+batch_size]
+                                    #     batch_sdf = self.model.geometry(batch_pos, with_grad=False, with_feature=False)
+                                    #     inside_xyz_sdf_list.append(batch_sdf.detach())  # 立即detach
+                                    
                                     # calculate the sdf of 3D Gaussians in the frontground.
                                     inside_xyz_sdf = self.model.geometry(inside_positions, with_grad=False, with_feature=False)
 
@@ -961,7 +983,7 @@ class NeuSSystem(BaseSystem):
         # Set up output folder
         print("Output folder: {}".format(args.model_path))
         os.makedirs(args.model_path, exist_ok = True)
-        with open(os.path.join(args.model_path, "GS_cfg_args"), 'w') as cfg_log_f:
+        with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
             cfg_log_f.write(str(Namespace(**vars(args))))
 
         with open(os.path.join(args.model_path, "GS_cfg_args_origin"), 'w') as cfg_log_f:

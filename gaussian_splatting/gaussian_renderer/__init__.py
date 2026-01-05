@@ -186,7 +186,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scaling,
             rotations = rot,
             cov3D_precomp = None)
-        rendered_depth_hand = out[0]
+        rendered_depth_hand = out[0][:1, :, :]
         return_dict.update({'depth_hand': rendered_depth_hand})
 
     if return_normal:
@@ -211,7 +211,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations=rot,
             cov3D_precomp=None,
         )
-        render_normal = out[0]
+        render_normal = out[0][:3, :, :]
         render_normal = torch.nn.functional.normalize(render_normal, dim=0)
 
         return_dict.update({'gs_normal': render_normal})

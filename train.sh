@@ -1,7 +1,9 @@
 exp_dir=./exp
-config=configs/tnt/barn.yaml
+config=configs/mipnerf360/bicycle.yaml
 gpu=0
-tag=release
+tag=ORIGINAL/bicycle
+
+mkdir -p output/${tag}/logger
 
 python launch.py \
     --exp_dir ${exp_dir} \
@@ -9,4 +11,6 @@ python launch.py \
     --gpu ${gpu} \
     --train \
     --eval \
-    tag=${tag}
+    tag=${tag}\
+    | tee output/${tag}/logger/training.log
+

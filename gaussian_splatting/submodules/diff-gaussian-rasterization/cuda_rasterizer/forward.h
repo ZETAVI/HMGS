@@ -54,6 +54,7 @@ namespace FORWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		float focal_x, float focal_y,
 		const float2* points_xy_image,
 		const float* features,
 		const float* view2gaussian,

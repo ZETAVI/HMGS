@@ -34,6 +34,9 @@ from gaussian_splatting.gaussian_renderer import GaussianModel
 from os import makedirs
 import matplotlib.pyplot as plt
 import cv2
+from gaussian_splatting.utils.visualize_utils import apply_depth_colormap
+from gaussian_splatting.utils.depth_utils import depth_to_normal
+from gaussian_splatting.utils.image_utils import error_map
 
 # def colorize_depth_maps(depth_map, min_depth, max_depth, cmap="Spectral", valid_mask=None):
 #         """
@@ -127,6 +130,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "normals")
     opacity_path = os.path.join(model_path, name, "ours_{}".format(iteration), "opacitys")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    depth_GOF_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depths_GOF")
+    normal_GOF_path = os.path.join(model_path, name, "ours_{}".format(iteration), "normals_GOF")
+    error_GOF_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors_GOF")
+    accumulate_GOF_path = os.path.join(model_path, name, "ours_{}".format(iteration), "accumulates_GOF")
 
 
     makedirs(render_path, exist_ok=True)
@@ -137,6 +144,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(normal_path, exist_ok=True)
     makedirs(opacity_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    makedirs(depth_GOF_path, exist_ok=True)
+    makedirs(normal_GOF_path, exist_ok=True)
+    makedirs(error_GOF_path, exist_ok=True)
+    makedirs(accumulate_GOF_path, exist_ok=True)
+
+
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
@@ -162,6 +175,30 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # import pdb;pdb.set_trace()
         gt = view.original_image[0:3, :, :]
         # import pdb;pdb.set_trace()
+
+        # 渲染深度图和法线图
+        normal = render_pkg["normal"]
+        normal = torch.nn.functional.normalize(normal, p=2, dim=0)
+        # transform to world space
+        c2w = (view.world_view_transform.T).inverse()
+        normal2 = c2w[:3, :3] @ normal.reshape(3, -1)
+        normal = normal2.reshape(3, *normal.shape[1:])
+        normal = (normal + 1.) / 2.
+
+        depth_black = render_pkg["depth_map"]
+        depth_normal, _ = depth_to_normal(view, depth_black)
+        depth_normal = (depth_normal + 1.) / 2.
+        depth_normal = depth_normal.permute(2, 0, 1)
+
+        depth_map = apply_depth_colormap(depth_black.permute(1, 2, 0), render_pkg["accumulation"].permute(1, 2, 0), near_plane=None, far_plane=None)
+        depth_map = depth_map.permute(2, 0, 1)  # HWC -> CHW
+
+        accumlated_alpha = render_pkg["accumulation"]
+        colored_accum_alpha = apply_depth_colormap(accumlated_alpha.permute(1, 2, 0), None, near_plane=0.0, far_plane=1.0)
+        colored_accum_alpha = colored_accum_alpha.permute(2, 0, 1)
+
+        error_image = error_map(rendering, gt)
+
 
         name_list.append('{0:05d}'.format(idx) + ".png")
         # import pdb;pdb.set_trace()
@@ -194,6 +231,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         
 
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+
+        torchvision.utils.save_image(depth_map, os.path.join(depth_GOF_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(normal, os.path.join(normal_GOF_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(error_image, os.path.join(error_GOF_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(colored_accum_alpha, os.path.join(accumulate_GOF_path, '{0:05d}'.format(idx) + ".png"))
 
     t = np.array(t_list[5:])
     fps = 1.0 / t.mean()
@@ -229,6 +271,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--config",required=True, help='path to config file,for the normalization parameters')
     args = get_combined_args(parser)
+    args.resolution = 4
     print("Rendering " + args.model_path)
     from instant_nsr.utils.misc import load_config    
 

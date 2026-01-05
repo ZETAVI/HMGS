@@ -475,6 +475,7 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	float focal_x, float focal_y,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ view2gaussian,
@@ -498,6 +499,9 @@ renderCUDA(
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 
+	// create the ray
+	float2 ray = { (pixf.x - W/2.) / focal_x, (pixf.y - H/2.) / focal_y };
+
 	// Load start/end range of IDs to process in bit sorted list.
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -513,6 +517,7 @@ renderCUDA(
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
+	uint32_t max_contributor = -1;
 	// float C[CHANNELS] = { 0 };
 	float C[CHANNELS*2+2] = { 0 };
 
@@ -626,8 +631,8 @@ renderCUDA(
 		}
 
 		// depth and alpha
-		out_color[DEPTH_OFFSET * H * W + pix_id] = C[CHANNELS * 2];
-		out_color[ALPHA_OFFSET * H * W + pix_id] = C[CHANNELS * 2 + 1];
+		out_color[6 * H * W + pix_id] = C[CHANNELS * 2];
+		out_color[7 * H * W + pix_id] = C[CHANNELS * 2 + 1];
 
 	}
 }
@@ -637,6 +642,7 @@ void FORWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	float focal_x, float focal_y,
 	const float2* means2D,
 	const float* colors,
 	const float* view2gaussian,
@@ -650,6 +656,7 @@ void FORWARD::render(
 		ranges,
 		point_list,
 		W, H,
+		focal_x, focal_y,
 		means2D,
 		colors,
 		view2gaussian,
