@@ -621,6 +621,8 @@ class NeuSSystem(BaseSystem):
             
             # 设置异常检测
             torch.autograd.set_detect_anomaly(args.detect_anomaly)
+
+            # 3DGS 分支其实也会共用img_downscale配置
             args.resolution = config.dataset.img_downscale
             self.args = args
             

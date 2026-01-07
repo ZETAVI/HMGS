@@ -120,7 +120,17 @@ class ColmapDatasetBase():
                 w, h = self.config.img_wh
                 assert round(W / w * h) == H
             elif 'img_downscale' in self.config:
-                w, h = round(W / self.config.img_downscale), round(H / self.config.img_downscale)
+                # 新增逻辑：如果配置为 -1，则自动计算下采样倍率以限制最大边长为 1600
+                if self.config.img_downscale == -1:
+                    if W > 1600:
+                        scale = W / 1600.0
+                        w = 1600    # int(W / scale) is always 1600
+                        h = int(H / scale)
+                    else:
+                        w, h = W, H
+                else:
+                    # 原有逻辑
+                    w, h = round(W / self.config.img_downscale), round(H / self.config.img_downscale)
             else:
                 raise KeyError("Either img_wh or img_downscale should be specified.")
 
