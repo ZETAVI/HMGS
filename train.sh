@@ -68,7 +68,7 @@ for ((i=0; i<${#scenes[@]}; i++)); do
     res="${resolutions[$i]}"
     
     echo "----------------------------------------------------------------"
-    echo "Processing Scene [$((i+1))/${#scenes[@]}]: ${scene} (Resolution: 1/${res})"
+    echo "Processing Scene [$((i+1))/${#scenes[@]}]: ${scene} (Resolution: ${res})"
     echo "----------------------------------------------------------------"
 
     # 定义变量
@@ -108,6 +108,11 @@ for ((i=0; i<${#scenes[@]}; i++)); do
     # B. 渲染 / Rendering (render.py)
     # --------------------------------------
     echo "[Step 2/3] Starting Rendering..."
+
+    # 构建并打印命令，方便调试
+    cmd_render="python render.py -m ${output_dir} --config ${config} --skip_train --iteration -1 --resolution ${res}"
+    echo "Running: $cmd_render"
+
     # -m 指定模型输出路径, --resolution 指定降采样倍率
     python render.py \
         -m "${output_dir}" \
@@ -121,7 +126,11 @@ for ((i=0; i<${#scenes[@]}; i++)); do
     # C. 评估 / Metrics (metrics.py)
     # --------------------------------------
     echo "[Step 3/3] Calculating Metrics..."
-    # 修正了原脚本中两个 python 的笔误
+
+    # 构建并打印命令，方便调试
+    cmd_metrics="python metrics.py -m ${output_dir}"
+    echo "Running: $cmd_metrics"
+
     python metrics.py \
         -m "${output_dir}" \
         | tee "${log_dir}/metrics.log"
