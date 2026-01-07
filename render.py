@@ -269,9 +269,9 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--resolution", type=int, default=4)
     parser.add_argument("--config",required=True, help='path to config file,for the normalization parameters')
     args = get_combined_args(parser)
-    args.resolution = 4
     print("Rendering " + args.model_path)
     from instant_nsr.utils.misc import load_config    
 

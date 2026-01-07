@@ -642,7 +642,7 @@ class NeuSSystem(BaseSystem):
             #                               for i in range(0, len(self.testing_iterations), 2)]
             # 如果为空，使用默认值
             # if not self.neus_render_iterations:
-            self.neus_render_iterations = [100, 10000, 15100, 20000, 30000]
+            self.neus_render_iterations = [25000, 45000]
             
             # 创建高斯模型
             self.gaussians = GaussianModel(self.lp.feat_dim, self.lp.n_offsets, self.lp.voxel_size, 
