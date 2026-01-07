@@ -148,6 +148,333 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
             
         torch.cuda.empty_cache()
 
+def neus_rendering_report(neus_system, dataset_name, iteration, testing_iterations, tb_writer=None, logger=None):
+    """
+    NeuS分支的场景渲染报告函数
+
+    与GS分支的training_report对应，专门用于NeuS分支的渲染可视化
+    在指定的iteration对test和train视角进行NeuS完整场景渲染
+
+    Args:
+        neus_system: NeuSSystem实例（self）
+        dataset_name: 数据集名称
+        current_step: 当前训练步数
+        tb_writer: TensorBoard SummaryWriter（self.tb_writer，与GS共享）
+        logger: 日志信息记录器 (self.loggger)
+
+    功能：
+        1. 对test和train视角进行NeuS完整场景渲染
+        2. 可视化NeuS的各种输出（RGB、depth、normal、opacity、background等）
+        3. 记录到TensorBoard (output目录，与GS分支共享)
+        4. 计算并记录评估指标（L1、PSNR）
+
+    与GS分支的区别：
+        - 使用NeuS模型渲染（体渲染+SDF）
+        - 渲染速度较慢，限制视角数量
+        - 输出更丰富（foreground/background分离、opacity等）
+        - 使用不同的命名前缀（NeuS_xxx）便于在tensorboard中区分
+    """
+    # 检查tb_writer
+    if tb_writer is None:
+        if logger:
+            logger.warning("TensorBoard writer not available, skipping NeuS rendering report")
+        return
+
+    # if logger:
+    #     logger.info(f"\n{'='*60}")
+    #     logger.info(f"[STEP {iteration}] NeuS Branch Rendering Report")
+    #     logger.info(f"{'='*60}")
+
+    torch.cuda.empty_cache()
+
+    if iteration in testing_iterations:
+
+        # 配置要渲染的视角（NeuS渲染慢，只渲染少量视角）
+        validation_configs = (
+            {
+                'name': 'test',
+                # 'cameras': neus_system.scene.getTestCameras()[:8],  # 限制为前8个test视角
+                'cameras': neus_system.scene.getTestCameras(),
+                'log_prefix': f'{dataset_name}_NeuS_test'
+            },
+            {
+                'name': 'train',
+                'cameras': [neus_system.scene.getTrainCameras()[idx % len(neus_system.scene.getTrainCameras())]
+                        for idx in range(5, min(20, len(neus_system.scene.getTrainCameras())), 5)],  # 每隔5个取一个，最多3个
+                'log_prefix': f'{dataset_name}_NeuS/train'
+            }
+        )
+
+        for config in validation_configs:
+            if not config['cameras'] or len(config['cameras']) == 0:
+                continue
+
+            l1_test = 0.0
+            psnr_test = 0.0
+            render_count = 0
+
+            if logger:
+                logger.info(f"\nRendering {config['name']} views ({len(config['cameras'])} views)...")
+
+            for idx, viewpoint in enumerate(config['cameras']):
+                try:
+                    # 1. 准备数据 - 使用与preprocess_data相同的方式获取rays
+                    W, H = neus_system.dataset.img_wh
+
+                    # 获取相机姿态
+                    # 从viewpoint的Camera对象获取对应的索引
+                    cam_index = viewpoint.uid
+                    c2w = neus_system.dataset.all_c2w[cam_index]
+
+                    # 获取directions
+                    if neus_system.dataset.directions.ndim == 3:  # (H, W, 3)
+                        directions = neus_system.dataset.directions
+                    elif neus_system.dataset.directions.ndim == 4:  # (N, H, W, 3)
+                        directions = neus_system.dataset.directions[cam_index]
+
+                    # 使用get_rays生成全图的rays
+                    rays_o, rays_d = get_rays(directions, c2w)
+                    rays = torch.cat([rays_o, rays_d], dim=-1).reshape(-1, 6)
+
+                    # 准备batch
+                    batch = {
+                        'rays': rays.to(torch.device("cuda")),
+                        'rgb': neus_system.dataset.all_images[cam_index].reshape(-1, 3).to(torch.device("cuda")),
+                        'index': torch.tensor([cam_index], device="cuda")
+                    }
+
+                    # 2. NeuS渲染（不使用GS depth guide，纯NeuS渲染）
+                    with torch.no_grad():
+                        neus_system.model.eval()  # 确保评估模式
+                        out = neus_system(batch, gs_depth=None, use_depth_guide=False)
+                        neus_system.model.train()  # 恢复训练模式
+
+                    # 跳过无效渲染
+                    if 'zero_samples' in out and out['zero_samples']:
+                        if logger:
+                            logger.warning(f"  View {idx} ({viewpoint.image_name}): zero samples, skipped")
+                        continue
+
+                    # 3. 提取和处理渲染结果
+                    # RGB渲染（完整 = 前景 + 背景）
+                    comp_rgb_full = out['comp_rgb_full'].view(H, W, 3).permute(2, 0, 1)  # CHW
+                    comp_rgb_full = torch.clamp(comp_rgb_full, 0.0, 1.0)
+
+                    # 前景RGB
+                    comp_rgb = out['comp_rgb'].view(H, W, 3).permute(2, 0, 1)
+                    comp_rgb = torch.clamp(comp_rgb, 0.0, 1.0)
+
+                    # 前景深度图
+                    depth_fg = out['depth'].view(H, W, 1)
+                    # 不需要归一化，因为apply_depth_colormap会自动处理
+                    # depth_normalized = depth / (depth.max() + 1e-10)  # 归一化
+                    # depth_normalized_vis = depth_normalized.permute(2, 0, 1).repeat(3, 1, 1)  # CHW, 转为3通道
+
+                    # 前景不透明度
+                    opacity_fg = out['opacity'].view(H, W, 1)      # [H, W, 1]
+
+                    # # 深度图着色
+                    # depth_colored = apply_depth_colormap(
+                    #     depth,
+                    #     None,
+                    #     near_plane=None,
+                    #     far_plane=None
+                    # ).permute(2, 0, 1)  # CHW
+
+                    # 法线图
+                    comp_normal = out['comp_normal'].view(H, W, 3).permute(2, 0, 1)
+                    # 法线从[-1,1]归一化到[0,1]用于可视化
+                    comp_normal_vis = (comp_normal + 1.0) / 2.0
+                    comp_normal_vis = torch.clamp(comp_normal_vis, 0.0, 1.0)
+
+                    # # 不透明度/Alpha通道
+                    # opacity = out['opacity'].view(H, W, 1)
+                    # # 着色opacity以便更好可视化
+                    # opacity_colored = apply_depth_colormap(
+                    #     opacity,
+                    #     None,
+                    #     near_plane=0.0,
+                    #     far_plane=1.0
+                    # ).permute(2, 0, 1)
+
+                    # 背景（如果有learned_background）
+                    has_background = neus_system.config.model.learned_background and 'comp_rgb_bg' in out
+                    if has_background:
+                        comp_rgb_bg = out['comp_rgb_bg'].view(H, W, 3).permute(2, 0, 1)
+                        comp_rgb_bg = torch.clamp(comp_rgb_bg, 0.0, 1.0)
+
+                        # 背景深度和不透明度
+                        depth_bg = out['depth_bg'].view(H, W, 1)       # [H, W, 1]
+                        opacity_bg = out['opacity_bg'].view(H, W, 1)   # [H, W, 1]
+
+                    # ========== 3.2 合成整体depth和opacity（数值层面）==========
+                    # Opacity合成（Alpha Compositing）
+                    # opacity_full = opacity_fg + (1 - opacity_fg) * opacity_bg
+                    opacity_full = opacity_fg + (1.0 - opacity_fg) * opacity_bg  # [H, W, 1]
+                    
+                    # Depth合成（加权平均，权重为对最终图像的贡献度）
+                    # 前景贡献权重: w_fg = opacity_fg
+                    # 背景贡献权重: w_bg = (1 - opacity_fg) * opacity_bg
+                    # depth_full = (w_fg * depth_fg + w_bg * depth_bg) / (w_fg + w_bg)
+                    weight_fg = opacity_fg
+                    weight_bg = (1.0 - opacity_fg) * opacity_bg
+                    total_weight = weight_fg + weight_bg
+
+                    # 加权平均深度（避免除零）
+                    depth_full = (weight_fg * depth_fg + weight_bg * depth_bg) / (total_weight + 1e-10)
+
+                    # 对于完全透明的像素（total_weight ≈ 0），depth无意义，设置为前景深度
+                    mask_invalid = (total_weight < 1e-6)
+                    depth_full = torch.where(mask_invalid, depth_fg, depth_full)  # [H, W, 1]
+
+                    # ========== 3.3 统一进行颜色映射（转为CHW格式）==========
+                    # 深度着色（apply_depth_colormap支持CPU tensor）
+                    depth_fg_colored = apply_depth_colormap(
+                        depth_fg, None, near_plane=None, far_plane=None
+                    ).permute(2, 0, 1)  # CHW
+
+                    depth_bg_colored = apply_depth_colormap(
+                        depth_bg, None, near_plane=None, far_plane=None
+                    ).permute(2, 0, 1)  # CHW
+
+                    depth_full_colored = apply_depth_colormap(
+                        depth_full, None, near_plane=None, far_plane=None
+                    ).permute(2, 0, 1)  # CHW
+
+                    # 不透明度着色
+                    opacity_fg_colored = apply_depth_colormap(
+                        opacity_fg, None, near_plane=0.0, far_plane=1.0
+                    ).permute(2, 0, 1)  # CHW
+
+                    opacity_bg_colored = apply_depth_colormap(
+                        opacity_bg, None, near_plane=0.0, far_plane=1.0
+                    ).permute(2, 0, 1)  # CHW
+
+                    opacity_full_colored = apply_depth_colormap(
+                        opacity_full, None, near_plane=0.0, far_plane=1.0
+                    ).permute(2, 0, 1)  # CHW
+
+
+                    # Ground truth
+                    # gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_image = viewpoint.original_image.to(torch.device("cpu"))
+                    gt_image = torch.clamp(gt_image, 0.0, 1.0)
+
+                    # 误差图（完整渲染 vs GT）
+                    error_image = error_map(comp_rgb_full, gt_image)
+
+                    # 4. 记录到TensorBoard（使用tb_writer，与GS分支共享）
+                    view_name = viewpoint.image_name
+
+                    # 主要渲染输出（按重要性排序，便于在tensorboard中查看）
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/1_render_full',
+                        comp_rgb_full[None],
+                        global_step=iteration
+                    )
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/2_errormap',
+                        error_image[None],
+                        global_step=iteration
+                    )
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/3_depth_full',
+                        depth_full_colored[None],
+                        global_step=iteration
+                    )
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/4_normal',
+                        comp_normal_vis[None],
+                        global_step=iteration
+                    )
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/5_opacity_full',
+                        opacity_full_colored[None],
+                        global_step=iteration
+                    )
+
+
+                    # 前景/背景分离
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/6_render_foreground',
+                        comp_rgb[None],
+                        global_step=iteration
+                    )
+                    if has_background:
+                        tb_writer.add_images(
+                            f'{config["log_prefix"]}_view_{view_name}/7_render_background',
+                            comp_rgb_bg[None],
+                            global_step=iteration
+                    )
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/depth_foreground',
+                        depth_fg_colored[None],
+                        global_step=iteration
+                    )
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/depth_background',
+                        depth_bg_colored[None],
+                        global_step=iteration
+                    )
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/opacity_foreground',
+                        opacity_fg_colored[None],
+                        global_step=iteration
+                    )
+                    tb_writer.add_images(
+                        f'{config["log_prefix"]}_view_{view_name}/opacity_background',
+                        opacity_bg_colored[None],
+                        global_step=iteration
+                    )
+
+                    
+
+                    # Ground truth（只在第一次记录）
+                    if iteration == testing_iterations[0]:
+                        tb_writer.add_images(
+                            f'{config["log_prefix"]}_view_{view_name}/0_ground_truth',
+                            gt_image[None],
+                            global_step=iteration
+                        )
+
+                    # 5. 计算指标
+                    l1_test += l1_loss(comp_rgb_full, gt_image).mean().double()
+                    psnr_test += psnr(comp_rgb_full, gt_image).mean().double()
+                    render_count += 1
+
+                    if logger and (idx % 2 == 0 or idx == len(config['cameras']) - 1):
+                        logger.info(f"  Rendered view {idx+1}/{len(config['cameras'])} ({view_name})")
+
+                except Exception as e:
+                    if logger:
+                        logger.error(f"  Error rendering view {idx}: {str(e)}")
+                    import traceback
+                    if logger:
+                        logger.error(traceback.format_exc())
+                    continue
+
+            # 6. 平均指标并记录
+            if render_count > 0:
+                psnr_test /= render_count
+                l1_test /= render_count
+
+                if logger:
+                    logger.info(f"\n[STEP {iteration}] NeuS {config['name']}: L1 {l1_test:.6f}, PSNR {psnr_test:.4f}")
+
+                # 记录标量指标（与GS分支类似）
+                tb_writer.add_scalar(f'{config["log_prefix"]}/l1_loss', l1_test, iteration)
+                tb_writer.add_scalar(f'{config["log_prefix"]}/psnr', psnr_test, iteration)
+
+        # # 记录NeuS特有的参数
+        # if 'inv_s' in out:
+        #     inv_s_value = out['inv_s'].item() if hasattr(out['inv_s'], 'item') else float(out['inv_s'])
+        #     tb_writer.add_scalar(f'{dataset_name}_NeuS/params/inv_s', inv_s_value, current_step)
+
+        torch.cuda.empty_cache()
+
+        if logger:
+            logger.info(f"{'='*60}\n")
+
 def get_logger(path):
     import logging
 
@@ -307,6 +634,15 @@ class NeuSSystem(BaseSystem):
             self.lp = lp.extract(args)
             self.saving_iterations = args.save_iterations
             self.testing_iterations = args.test_iterations
+
+
+            # NeuS专用的渲染报告间隔（比GS稀疏，因为NeuS渲染慢）
+            # 自动从GS的test_iterations生成：取每2个
+            # self.neus_render_iterations = [self.testing_iterations[i]
+            #                               for i in range(0, len(self.testing_iterations), 2)]
+            # 如果为空，使用默认值
+            # if not self.neus_render_iterations:
+            self.neus_render_iterations = [100, 10000, 15100, 20000, 30000]
             
             # 创建高斯模型
             self.gaussians = GaussianModel(self.lp.feat_dim, self.lp.n_offsets, self.lp.voxel_size, 
@@ -771,6 +1107,16 @@ class NeuSSystem(BaseSystem):
                         self.progress_bar.close()
 
                     training_report(self.tb_writer, self.args.source_path.split('/')[-1], current_epoch_gs, Ll1, loss_gaussian, l1_loss, iter_start.elapsed_time(iter_end), self.args.test_iterations, self.scene, gaussian_renderer.render, (self.piplin, self.background), None, self.loggger)
+
+                    # NeuS分支的渲染报告（使用独立的测试间隔，输出到同一个tensorboard）
+                    neus_rendering_report(
+                        neus_system=self,
+                        dataset_name=self.args.source_path.split('/')[-1],
+                        iteration=current_epoch_gs,
+                        testing_iterations=self.neus_render_iterations,
+                        tb_writer=self.tb_writer,  # 与GS分支共享同一个tb_writer
+                        logger=self.loggger
+                    )
 
                     if (current_epoch_gs in self.saving_iterations):
                         self.loggger.info("\n[ITER {}] Saving Gaussians".format(current_epoch_gs))
