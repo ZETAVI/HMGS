@@ -25,6 +25,8 @@
 -- lsyncd ~/lsyncd.conf.lua
 -- # 或者作为系统服务运行（需要把配置文件放到 /etc/lsyncd.conf 并确保 root 有 SSH key）
 -- sudo service lsyncd start
+-- 查看日志
+-- tail -f /tmp/lsyncd.log
 
 
 settings {
