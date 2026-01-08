@@ -29,28 +29,14 @@ echo "Experiment Directory: $exp_dir"
 # 场景名称列表 (对应 configs/mipnerf360/ 下的 yaml 文件名)
 # 你可以在这里添加更多的场景
 scenes=(
-    # "bicycle"
-    "bonsai"
-    "counter"
-    # "flowers"
-    "garden_combine"
-    "stump"
-    "treehill"
-    "kitchen_combine"
-    "room"
+    'drjohnson'
+    'playroom'
 )
 
 # 对应的渲染分辨率 (1, 2, 4 等) - 索引必须与 scenes 一一对应
 resolutions=(
-    # 4
-    2
-    2
-    # 4
-    4
-    4
-    4
-    2
-    2
+    -1
+    -1
 )
 
 # 检查数组长度是否一致
@@ -73,7 +59,7 @@ for ((i=0; i<${#scenes[@]}; i++)); do
 
     # 定义变量
     config="configs/mipnerf360/${scene}.yaml"
-    tag="ORIGINAL/${scene}"
+    tag="ORIGINAL_DB/${scene}"
     output_dir="output/${tag}"
     log_dir="${output_dir}/logger"
 
@@ -89,14 +75,14 @@ for ((i=0; i<${#scenes[@]}; i++)); do
     cmd_train="python launch.py --exp_dir ${exp_dir} --config ${config} --gpu ${gpu} --train --eval tag=${tag}"
     echo "Running: $cmd_train"
     
-    python launch.py \
+    python -u launch.py \
         --exp_dir "${exp_dir}" \
         --config "${config}" \
         --gpu "${gpu}" \
         --train \
         --eval \
         tag="${tag}" \
-        | tee "${log_dir}/training.log"
+        2>&1 | tee "${log_dir}/training.log"
     
     # 检查上一步的退出状态 (使用 PIPESTATUS 获取管道前一个命令也就是 python 的状态)
     if [ ${PIPESTATUS[0]} -ne 0 ]; then
@@ -114,13 +100,13 @@ for ((i=0; i<${#scenes[@]}; i++)); do
     echo "Running: $cmd_render"
 
     # -m 指定模型输出路径, --resolution 指定降采样倍率
-    python render.py \
+    python -u render.py \
         -m "${output_dir}" \
         --config "${config}" \
         --skip_train \
         --iteration -1 \
         --resolution "${res}" \
-        | tee "${log_dir}/render.log"
+        2>&1 | tee "${log_dir}/render.log"
 
     # --------------------------------------
     # C. 评估 / Metrics (metrics.py)
@@ -131,9 +117,9 @@ for ((i=0; i<${#scenes[@]}; i++)); do
     cmd_metrics="python metrics.py -m ${output_dir}"
     echo "Running: $cmd_metrics"
 
-    python metrics.py \
+    python -u metrics.py \
         -m "${output_dir}" \
-        | tee "${log_dir}/metrics.log"
+        2>&1 | tee "${log_dir}/metrics.log"
 
     echo "Done processing ${scene}."
     echo ""
