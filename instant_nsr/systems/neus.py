@@ -359,6 +359,11 @@ def neus_rendering_report(neus_system, dataset_name, iteration, testing_iteratio
                     # gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     gt_image = viewpoint.original_image.to(torch.device("cpu"))
                     gt_image = torch.clamp(gt_image, 0.0, 1.0)
+                    # 使用Neus dataset的图片，确保尺寸与渲染out结果一致
+                    # 这里viewpoint.original_image时GS加载的原始尺寸
+                    # 而Neus渲染使用的是下采样后的尺寸
+                    gt_image = neus_system.dataset.all_images[cam_index].view(H, W, 3).permute(2, 0, 1)  # CHW
+                    gt_image = gt_image.to(torch.device("cpu"))
 
                     # 误差图（完整渲染 vs GT）
                     error_image = error_map(comp_rgb_full, gt_image)
@@ -621,6 +626,8 @@ class NeuSSystem(BaseSystem):
             
             # 设置异常检测
             torch.autograd.set_detect_anomaly(args.detect_anomaly)
+
+            # 3DGS 分支其实也会共用img_downscale配置
             args.resolution = config.dataset.img_downscale
             self.args = args
             
