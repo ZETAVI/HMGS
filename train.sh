@@ -29,8 +29,8 @@ echo "Experiment Directory: $exp_dir"
 # 场景名称列表 (对应 configs/mipnerf360/ 下的 yaml 文件名)
 # 你可以在这里添加更多的场景
 scenes=(
-    'drjohnson'
-    'playroom'
+    'db_drjohnson'
+    'db_playroom'
 )
 
 # 对应的渲染分辨率 (1, 2, 4 等) - 索引必须与 scenes 一一对应
@@ -58,7 +58,7 @@ for ((i=0; i<${#scenes[@]}; i++)); do
     echo "----------------------------------------------------------------"
 
     # 定义变量
-    config="configs/mipnerf360/${scene}.yaml"
+    config="configs/db/${scene}.yaml"
     tag="ORIGINAL_DB/${scene}"
     output_dir="output/${tag}"
     log_dir="${output_dir}/logger"
